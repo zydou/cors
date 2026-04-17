@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 // Response 标准响应格式
@@ -40,19 +41,30 @@ func createHTTPClient() *http.Client {
 		proxyURL, err := url.Parse(httpProxy)
 		if err != nil {
 			log.Printf("Failed to parse proxy URL: %v, using direct connection", err)
-			transport = &http.Transport{}
+			transport = &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 10,
+				IdleConnTimeout:     90 * time.Second,
+			}
 		} else {
 			transport = &http.Transport{
-				Proxy: http.ProxyURL(proxyURL),
+				Proxy:               http.ProxyURL(proxyURL),
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 10,
+				IdleConnTimeout:     90 * time.Second,
 			}
 		}
 	} else {
 		log.Println("Using direct connection (no proxy configured)")
-		transport = &http.Transport{}
+		transport = &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		}
 	}
 
 	client := &http.Client{
-		Timeout:   0, // 无超时限制，适用于大文件下载
+		Timeout: 0, // 无超时限制，适用于大文件下载
 		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return nil // 自动跟随重定向
@@ -150,7 +162,9 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 写入响应状态和内容
 	w.WriteHeader(proxyResp.StatusCode)
-	_, err = io.Copy(w, proxyResp.Body)
+	// 使用更大的缓冲区提高传输效率（64KB）
+	buf := make([]byte, 64*1024)
+	_, err = io.CopyBuffer(w, proxyResp.Body, buf)
 	if err != nil {
 		log.Printf("Error copying response body: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
