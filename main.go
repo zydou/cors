@@ -189,11 +189,11 @@ func main() {
 		PORT = envPort
 	}
 
-	log.Printf("Proxy server is running on http://localhost:%s", PORT)
-	log.Printf("Usage: GET http://localhost:%s/{URL}", PORT)
-	log.Printf("Example: GET http://localhost:%s/http://nginx.org/download/nginx-1.20.2.tar.gz", PORT)
+	log.Printf("Proxy server is running on http://0.0.0.0:%s", PORT)
+	log.Printf("Usage: GET http://0.0.0.0:%s/{URL}", PORT)
+	log.Printf("Example: GET http://0.0.0.0:%s/http://nginx.org/download/nginx-1.20.2.tar.gz", PORT)
 
-	err := http.ListenAndServe(":"+PORT, nil)
+	err := http.ListenAndServe("0.0.0.0:"+PORT, nil)
 	if err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}

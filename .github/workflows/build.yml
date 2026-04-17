@@ -42,13 +42,16 @@ jobs:
           go-version: 1.26
 
       - name: Cross compile for multiple platforms
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
         run: |
           # 交叉编译到所有目标平台
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o cors-linux-amd64 main.go
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o cors-linux-arm64 main.go
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm go build -o cors-linux-arm main.go
-          CGO_ENABLED=0 GOOS=linux GOARCH=ppc64le go build -o cors-linux-ppc64le main.go
-          CGO_ENABLED=0 GOOS=linux GOARCH=s390x go build -o cors-linux-s390x main.go
+          GOARCH=amd64 go build -o cors-linux-amd64 main.go
+          GOARCH=arm64 go build -o cors-linux-arm64 main.go
+          GOARCH=arm go build -o cors-linux-arm main.go
+          GOARCH=ppc64le go build -o cors-linux-ppc64le main.go
+          GOARCH=s390x go build -o cors-linux-s390x main.go
           # 查看编译结果
           ls -la
 

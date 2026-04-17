@@ -40,6 +40,48 @@ export HTTPS_PROXY=http://127.0.0.1:7890
 export PORT=8080
 ```
 
+## Docker 部署
+
+### 构建和运行 Docker 镜像
+
+```bash
+# 构建 Docker 镜像
+docker build -t cors-proxy .
+
+# 运行 Docker 容器
+docker run -d -p 3000:3000 --name cors-container cors-proxy
+
+# 使用自定义端口和代理运行
+docker run -d -p 8080:8080 \
+  -e PORT=8080 \
+  -e HTTP_PROXY=http://127.0.0.1:7890 \
+  --name cors-container cors-proxy
+```
+
+### 使用 Docker Compose
+
+创建 `docker-compose.yml` 文件：
+
+```yaml
+version: '3.8'
+services:
+  cors-proxy:
+    build: .
+    container_name: cors-proxy
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - HTTP_PROXY=http://127.0.0.1:7890
+    restart: unless-stopped
+```
+
+然后运行：
+
+```bash
+docker-compose up -d
+```
+
 ## 编译和运行
 
 ### 编译
@@ -49,13 +91,13 @@ export PORT=8080
 go build -o cors main.go
 
 # 编译为 Linux 系统的可执行文件（跨平台编译）
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o cors-linux-amd64 proxy.go
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o cors-linux-amd64 main.go
 
 # 编译为 macOS 系统的可执行文件（跨平台编译）
-CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o cors-darwin-arm64 proxy.go
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o cors-darwin-arm64 main.go
 
 # 编译为 Windows 系统的可执行文件（跨平台编译）
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o cors-windows-amd64.exe proxy.go
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o cors-windows-amd64.exe main.go
 ```
 
 ### 运行
@@ -90,7 +132,13 @@ GET http://your-server-address/{目标URL}
 要下载 `http://nginx.org/download/nginx-1.20.2.tar.gz`，可以请求：
 
 ```http
-GET http://localhost:3000/http://nginx.org/download/nginx-1.20.2.tar.gz
+GET http://0.0.0.0:3000/http://nginx.org/download/nginx-1.20.2.tar.gz
+```
+
+或者使用服务器的实际IP地址或域名：
+
+```http
+GET http://your-server-ip:3000/http://nginx.org/download/nginx-1.20.2.tar.gz
 ```
 
 ### 实际场景
