@@ -10,12 +10,73 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 )
+
+// isPrivateIP 检查 IP 是否为私有/保留/链路本地地址，用于 SSRF 防护
+func isPrivateIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+	// 覆盖所有私有 CIDR
+	privateBlocks := []string{
+		"10.0.0.0/8",     // RFC1918
+		"172.16.0.0/12",  // RFC1918
+		"192.168.0.0/16", // RFC1918
+		"127.0.0.0/8",    // Loopback
+		"169.254.0.0/16", // Link-local / 云元数据
+		"100.64.0.0/10",  // CGNAT (RFC6598)
+		"::1/128",        // IPv6 loopback
+		"fc00::/7",       // IPv6 unique local
+		"fe80::/10",      // IPv6 link-local
+	}
+	for _, cidr := range privateBlocks {
+		_, block, err := net.ParseCIDR(cidr)
+		if err == nil && block.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateTargetURL 验证目标 URL 是否允许访问（SSRF 防护）
+// 解析 hostname 为任一 IP 落在私有范围则拒绝
+func validateTargetURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %w", err)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("URL has no host")
+	}
+
+	// 先检查 host 本身是不是字面 IP（避免 DNS 重绑定：解析后再查一次）
+	if ip := net.ParseIP(host); ip != nil {
+		if isPrivateIP(ip) {
+			return fmt.Errorf("access to private/internal IP %s is forbidden (SSRF protection)", host)
+		}
+		return nil
+	}
+
+	// 域名：解析后检查所有 A/AAAA 记录
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		// 无法解析的域名直接拒绝，不继续请求（安全侧）
+		return fmt.Errorf("cannot resolve host %s: %w", host, err)
+	}
+	for _, ip := range ips {
+		if isPrivateIP(ip) {
+			return fmt.Errorf("host %s resolves to private/internal IP %s (SSRF protection)", host, ip)
+		}
+	}
+	return nil
+}
 
 // parallelConns 并行下载的连接数（可通过 PARALLEL_CONNS 环境变量覆盖）
 // 范围：1（禁用并行）~ 16（上限，超过无益且可能被上游限速）
@@ -48,6 +109,7 @@ type flushWriter struct {
 	flusher http.Flusher
 	ticker *time.Ticker
 	done   chan struct{}
+	once   sync.Once // 保证 stop 幂等，防止 double-close channel panic
 }
 
 func newFlushWriter(w io.Writer, flusher http.Flusher, interval time.Duration) *flushWriter {
@@ -79,8 +141,10 @@ func (fw *flushWriter) Write(p []byte) (n int, err error) {
 }
 
 func (fw *flushWriter) stop() {
-	fw.ticker.Stop()
-	close(fw.done)
+	fw.once.Do(func() {
+		fw.ticker.Stop()
+		close(fw.done)
+	})
 }
 
 // copyHeaders 复制响应头，过滤掉代理自己设置的头（避免冲突）
@@ -170,14 +234,20 @@ func parallelDownload(ctx context.Context, targetUrl string, totalSize int64, nu
 	sem := make(chan struct{}, numConnections)
 	var wg sync.WaitGroup
 
+	startedChunks := 0
 	for i := 0; i < totalChunks; i++ {
 		// 获取信号量（如果没有空闲连接，阻塞等待）
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
+			// ctx 取消：给未启动的 chunk 发送错误结果，让 wg 能归零
+			for j := startedChunks; j < totalChunks; j++ {
+				channels[j] <- chunkResult{index: j, err: ctx.Err()}
+			}
 			return ctx.Err()
 		}
 
+		startedChunks++
 		wg.Add(1)
 		go func(chunkIndex int) {
 			defer wg.Done()
@@ -423,6 +493,34 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	// 修复 URL 协议
 	targetUrl = fixUrl(targetUrl)
 
+	// 仅允许 http/https 协议
+	u, err := url.Parse(targetUrl)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		w.WriteHeader(http.StatusBadRequest)
+		res := Response{
+			Code:  400,
+			Usage: "GET Host/{URL}",
+			Note:  "Proxy server for downloading files from external resources",
+			Msg:   "Invalid URL: only http and https schemes are allowed",
+		}
+		json.NewEncoder(w).Encode(res)
+		return
+	}
+
+	// SSRF 防护：检查解析后的 IP 是否落在私有/保留地址段
+	if err := validateTargetURL(targetUrl); err != nil {
+		log.Printf("Blocked private/internal request to %s from %s: %v", targetUrl, r.RemoteAddr, err)
+		w.WriteHeader(http.StatusForbidden)
+		res := Response{
+			Code:  403,
+			Usage: "GET Host/{URL}",
+			Note:  "Proxy server for downloading files from external resources",
+			Msg:   err.Error(),
+		}
+		json.NewEncoder(w).Encode(res)
+		return
+	}
+
 	log.Printf("Proxying GET request to: %s", targetUrl)
 
 	// 获取 flusher（并行下载和单连接下载都需要）
@@ -536,21 +634,43 @@ func main() {
 	}
 
 	// 设置路由
-	http.HandleFunc("/", proxyHandler)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", proxyHandler)
 
-	// 启动服务器
-	PORT := "3000"
-	// 允许通过环境变量设置端口
-	if envPort := os.Getenv("PORT"); envPort != "" {
-		PORT = envPort
+	// 使用 http.Server 以便支持 graceful shutdown
+	srv := &http.Server{
+		Addr:    "0.0.0.0:" + getPort(),
+		Handler: mux,
 	}
 
-	log.Printf("Proxy server is running on http://0.0.0.0:%s", PORT)
-	log.Printf("Usage: GET http://0.0.0.0:%s/{URL}", PORT)
-	log.Printf("Example: GET http://0.0.0.0:%s/http://nginx.org/download/nginx-1.20.2.tar.gz", PORT)
+	// 优雅关闭：捕获 SIGTERM/SIGINT
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+		sig := <-sigCh
+		log.Printf("Received signal %s, shutting down gracefully...", sig)
 
-	err := http.ListenAndServe("0.0.0.0:"+PORT, nil)
-	if err != nil {
+		// 给正在进行的请求 30 秒完成
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Graceful shutdown failed: %v", err)
+		}
+	}()
+
+	log.Printf("Proxy server is running on http://0.0.0.0:%s", getPort())
+	log.Printf("Usage: GET http://0.0.0.0:%s/{URL}", getPort())
+	log.Printf("Example: GET http://0.0.0.0:%s/http://nginx.org/download/nginx-1.20.2.tar.gz", getPort())
+
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Failed to start server: %v", err)
 	}
+	log.Println("Server stopped.")
+}
+
+func getPort() string {
+	if envPort := os.Getenv("PORT"); envPort != "" {
+		return envPort
+	}
+	return "3000"
 }

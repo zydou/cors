@@ -1,5 +1,5 @@
 ---
-name: Docker
+name: Build and Push
 
 on:
   workflow_dispatch:
@@ -7,6 +7,8 @@ on:
     paths:
       - main.go
       - Dockerfile
+      - main_test.go
+      - go.mod
       - .github/workflows/build.yml
 
 concurrency:
@@ -22,6 +24,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@main
 
+      - name: Set up Go
+        uses: actions/setup-go@main
+        with:
+          go-version: 1.26
+
+      - name: Run tests
+        run: go test -v -race -count=1 .
+
+      - name: Vet
+        run: go vet .
+
+      - name: Build smoke check
+        run: go build -o /dev/null .
+
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@master
@@ -36,23 +52,16 @@ jobs:
             type=semver,pattern=v{{major}}
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Set up Go
-        uses: actions/setup-go@main
-        with:
-          go-version: 1.26
-
       - name: Cross compile for multiple platforms
         env:
           CGO_ENABLED: 0
           GOOS: linux
         run: |
-          # 交叉编译到所有目标平台
           GOARCH=amd64 go build -o cors-linux-amd64 main.go
           GOARCH=arm64 go build -o cors-linux-arm64 main.go
           GOARCH=arm go build -o cors-linux-arm main.go
           GOARCH=ppc64le go build -o cors-linux-ppc64le main.go
           GOARCH=s390x go build -o cors-linux-s390x main.go
-          # 查看编译结果
           ls -la
 
       - name: Set up Docker Buildx
@@ -65,7 +74,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
           registry: ghcr.io
 
-      - name: Build Docker
+      - name: Build and push Docker image
         uses: docker/build-push-action@master
         with:
           context: .
