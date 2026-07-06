@@ -4,19 +4,21 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
 // Response 标准响应格式
 type Response struct {
-	Code   int    `json:"code"`
-	Usage  string `json:"usage"`
-	Note   string `json:"note"`
-	Msg    string `json:"msg,omitempty"`
+	Code  int    `json:"code"`
+	Usage string `json:"usage"`
+	Note  string `json:"note"`
+	Msg   string `json:"msg,omitempty"`
 }
 
 // fixUrl 修复 URL 协议前缀
@@ -30,48 +32,64 @@ func fixUrl(u string) string {
 	}
 }
 
-// createHTTPClient 创建支持代理的 HTTP 客户端
+// 全局复用 HTTP 客户端 —— 连接池真正生效
+var client = createHTTPClient()
+
+// copy buffer 池化，减少 GC 压力
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 128*1024)
+	},
+}
+
+// createHTTPClient 创建支持代理的 HTTP 客户端（全局只调用一次）
 func createHTTPClient() *http.Client {
-	// 从环境变量获取代理配置
 	httpProxy := os.Getenv("HTTP_PROXY")
-	var transport *http.Transport
+
+	transport := &http.Transport{
+		// 连接池调优：提高每主机空闲连接上限
+		MaxIdleConns:        1000,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+
+		// TCP 读写缓冲区调优：减少系统调用次数
+		ReadBufferSize:  128 * 1024,
+		WriteBufferSize: 128 * 1024,
+
+		// 自定义拨号器：启用 TCP keep-alive，及时检测死连接
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			DualStack: true,
+		}).DialContext,
+
+		// 超时控制（Timeout: 0 仅限制整体，这里细化各阶段）
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 0, // 不限制，适配大文件
+
+		ForceAttemptHTTP2: true,
+	}
 
 	if httpProxy != "" {
-		log.Printf("Using proxy: %s", httpProxy)
 		proxyURL, err := url.Parse(httpProxy)
 		if err != nil {
 			log.Printf("Failed to parse proxy URL: %v, using direct connection", err)
-			transport = &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     90 * time.Second,
-			}
 		} else {
-			transport = &http.Transport{
-				Proxy:               http.ProxyURL(proxyURL),
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     90 * time.Second,
-			}
+			transport.Proxy = http.ProxyURL(proxyURL)
+			log.Printf("Using proxy: %s", httpProxy)
 		}
 	} else {
 		log.Println("Using direct connection (no proxy configured)")
-		transport = &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
-		}
 	}
 
-	client := &http.Client{
-		Timeout: 0, // 无超时限制，适用于大文件下载
+	return &http.Client{
+		Timeout: 0, // 无整体超时限制，适用于大文件下载
 		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return nil // 自动跟随重定向
 		},
 	}
-
-	return client
 }
 
 // proxyHandler 代理请求处理函数
@@ -80,9 +98,9 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		res := Response{
-			Code:   405,
-			Usage:  "GET Host/{URL}",
-			Note:   "Only GET requests are allowed",
+			Code:  405,
+			Usage: "GET Host/{URL}",
+			Note:  "Only GET requests are allowed",
 		}
 		json.NewEncoder(w).Encode(res)
 		return
@@ -93,9 +111,9 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	if len(path) == 0 {
 		w.WriteHeader(http.StatusOK)
 		res := Response{
-			Code:   0,
-			Usage:  "GET Host/{URL}",
-			Note:   "Proxy server for downloading files from external resources",
+			Code:  0,
+			Usage: "GET Host/{URL}",
+			Note:  "Proxy server for downloading files from external resources",
 		}
 		json.NewEncoder(w).Encode(res)
 		return
@@ -106,10 +124,10 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		res := Response{
-			Code:   400,
-			Usage:  "GET Host/{URL}",
-			Note:   "Proxy server for downloading files from external resources",
-			Msg:    "URL decoding failed",
+			Code:  400,
+			Usage: "GET Host/{URL}",
+			Note:  "Proxy server for downloading files from external resources",
+			Msg:   "URL decoding failed",
 		}
 		json.NewEncoder(w).Encode(res)
 		return
@@ -119,10 +137,10 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	if len(targetUrl) < 3 || !strings.Contains(targetUrl, ".") || targetUrl == "favicon.ico" || targetUrl == "robots.txt" {
 		w.WriteHeader(http.StatusBadRequest)
 		res := Response{
-			Code:   400,
-			Usage:  "GET Host/{URL}",
-			Note:   "Proxy server for downloading files from external resources",
-			Msg:    "Invalid URL",
+			Code:  400,
+			Usage: "GET Host/{URL}",
+			Note:  "Proxy server for downloading files from external resources",
+			Msg:   "Invalid URL",
 		}
 		json.NewEncoder(w).Encode(res)
 		return
@@ -133,20 +151,16 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Proxying GET request to: %s", targetUrl)
 
-	// 创建支持代理的 HTTP 客户端
-	client := createHTTPClient()
-
-	// 发送代理请求
-	var proxyResp *http.Response
-	proxyResp, err = client.Get(targetUrl)
+	// 使用全局复用的 HTTP 客户端
+	proxyResp, err := client.Get(targetUrl)
 	if err != nil {
 		log.Printf("Error proxying request: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		res := Response{
-			Code:   -1,
-			Usage:  "GET Host/{URL}",
-			Note:   "Proxy server for downloading files from external resources",
-			Msg:    err.Error(),
+			Code:  -1,
+			Usage: "GET Host/{URL}",
+			Note:  "Proxy server for downloading files from external resources",
+			Msg:   err.Error(),
 		}
 		json.NewEncoder(w).Encode(res)
 		return
@@ -162,17 +176,25 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 写入响应状态和内容
 	w.WriteHeader(proxyResp.StatusCode)
-	// 使用更大的缓冲区提高传输效率（64KB）
-	buf := make([]byte, 64*1024)
+
+	// 立即 flush，降低首字节时间（TTFB）
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+
+	// 从池中获取 buffer，减少分配
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(buf)
+
 	_, err = io.CopyBuffer(w, proxyResp.Body, buf)
 	if err != nil {
 		log.Printf("Error copying response body: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		res := Response{
-			Code:   -1,
-			Usage:  "GET Host/{URL}",
-			Note:   "Proxy server for downloading files from external resources",
-			Msg:    "Reading response body failed",
+			Code:  -1,
+			Usage: "GET Host/{URL}",
+			Note:  "Proxy server for downloading files from external resources",
+			Msg:   "Reading response body failed",
 		}
 		json.NewEncoder(w).Encode(res)
 		return
