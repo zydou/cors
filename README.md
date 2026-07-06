@@ -1,160 +1,89 @@
 # HTTP Proxy Server
 
-一个简单易用的 HTTP 代理服务器，专门用于下载海外资源。
+一个高性能 HTTP 代理服务器，专门用于在国内服务器下载海外资源（GitHub、NPM、CDN 等）。
 
 ## 功能特点
 
-- ✅ 只支持 GET 请求，专门用于下载文件
+- ✅ 多连接并行下载 — 大文件自动分块并行下载，充分利用带宽
+- ✅ CORS 跨域支持 — 浏览器可直接访问，无需后端中转
+- ✅ 客户端头转发 — User-Agent、Accept、Cookie 等全部透传，Referer 自动删除（绕过防盗链）
 - ✅ 自动跟随重定向
 - ✅ 支持 HTTP 代理配置（通过环境变量）
 - ✅ 完整的错误处理
-- ✅ 轻量级、高性能
-- ✅ 易于部署和维护
-- ✅ 无超时限制，适用于下载非常大的文件
+- ✅ 内核级 Socket Buffer 调优（2MB），适配跨境高延迟链路
+- ✅ 周期性 Flush，降低客户端感知延迟
+- ✅ 轻量级、高性能，零外部依赖
+- ✅ 无超时限制，适用于下载超大文件
+
+## 性能优化
+
+| 优化项 | 说明 |
+|--------|------|
+| 多连接并行 Range 下载 | ≥2MB 文件自动使用 8 连接并行分块下载（可调） |
+| 内核 Socket Buffer 2MB | 通过 `setsockopt(SO_RCVBUF/SO_SNDBUF)` 设置，适配高 BDP 链路 |
+| 用户态 bufio 512KB | 与 copy buffer 对齐，减少 syscall 次数 |
+| Copy Buffer 池化 | `sync.Pool` 复用 512KB buffer，降低 GC 压力 |
+| 周期性 Flush | 100ms 间隔推送数据到客户端 |
+| Connection Pool 复用 | 全局单例 HTTP client，连接池真正生效 |
+| TCP Keep-Alive | 30s 间隔检测死连接 |
+| Context 传播 | 客户端断开时自动取消所有下载 goroutine |
+| 客户端头转发 | User-Agent/Accept/Cookie 等透传，Referer 自动删除绕过防盗链 |
 
 ## 使用场景
 
-- 国内服务器下载海外资源（如 GitHub、NPM 等）
-- 需要代理的下载请求中转
+- 国内服务器下载海外资源（GitHub releases、NPM packages、Docker images 等）
+- 跨境高延迟链路的文件下载加速
 - 简单的文件下载代理服务
 
 ## 配置说明
 
-### 代理配置
+### 环境变量
 
-通过环境变量配置 HTTP 代理：
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `PORT` | `3000` | 服务器监听端口 |
+| `HTTP_PROXY` | (none) | 上游 HTTP 代理地址 |
+| `PARALLEL_CONNS` | `8` | 并行下载连接数（范围 `1`–`16`，设为 `1` 禁用并行） |
+
+## 快速开始
+
+### 编译运行
 
 ```bash
-# 使用 HTTP 代理
-export HTTP_PROXY=http://127.0.0.1:7890
+# 编译
+go build -o cors main.go
 
-# 或者使用 HTTPS 代理（如果支持）
-export HTTPS_PROXY=http://127.0.0.1:7890
+# 运行（默认配置）
+./cors
+
+# 自定义配置
+HTTP_PROXY=http://127.0.0.1:7890 PORT=8080 PARALLEL_CONNS=8 ./cors
 ```
 
-### 端口配置
-
-通过环境变量配置服务器端口：
+### 使用
 
 ```bash
-export PORT=8080
+# 基本用法
+curl -O http://localhost:3000/https://nginx.org/download/nginx-1.25.4.tar.gz
+
+# 通过代理访问
+curl -O http://your-server:3000/https://github.com/user/repo/releases/download/v1.0/file.tar.gz
 ```
 
 ## Docker 部署
 
-### 构建和运行 Docker 镜像
-
 ```bash
-# 构建 Docker 镜像
-docker build -t cors-proxy .
-
-# 运行 Docker 容器
-docker run -d -p 3000:3000 --name cors-container cors-proxy
-
-# 使用自定义端口和代理运行
-docker run -d -p 8080:8080 \
-  -e PORT=8080 \
+docker run -d -p 3000:3000 \
   -e HTTP_PROXY=http://127.0.0.1:7890 \
-  --name cors-container cors-proxy
+  -e PARALLEL_CONNS=8 \
+  ghcr.io/zydou/cors:latest
 ```
 
-### 使用 Docker Compose
+## 生产部署
 
-创建 `docker-compose.yml` 文件：
-
-```yaml
-version: '3.8'
-services:
-  cors-proxy:
-    build: .
-    container_name: cors-proxy
-    ports:
-      - "3000:3000"
-    environment:
-      - PORT=3000
-      - HTTP_PROXY=http://127.0.0.1:7890
-    restart: unless-stopped
-```
-
-然后运行：
+### systemd (Linux)
 
 ```bash
-docker-compose up -d
-```
-
-## 编译和运行
-
-### 编译
-
-```bash
-# 编译为当前系统架构的可执行文件
-go build -o cors main.go
-
-# 编译为 Linux 系统的可执行文件（跨平台编译）
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o cors-linux-amd64 main.go
-
-# 编译为 macOS 系统的可执行文件（跨平台编译）
-CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o cors-darwin-arm64 main.go
-
-# 编译为 Windows 系统的可执行文件（跨平台编译）
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o cors-windows-amd64.exe main.go
-```
-
-### 运行
-
-```bash
-# 直接运行
-./cors
-
-# 在后台运行（Linux/macOS）
-nohup ./cors > proxy.log 2>&1 &
-
-# 使用代理运行
-HTTP_PROXY=http://127.0.0.1:7890 ./cors
-
-# 使用代理和指定端口运行
-HTTP_PROXY=http://127.0.0.1:7890 PORT=8080 ./cors
-
-# 停止服务器
-pkill -f cors
-```
-
-## 使用方法
-
-### 基本用法
-
-```http
-GET http://your-server-address/{目标URL}
-```
-
-### 示例
-
-要下载 `http://nginx.org/download/nginx-1.20.2.tar.gz`，可以请求：
-
-```http
-GET http://0.0.0.0:3000/http://nginx.org/download/nginx-1.20.2.tar.gz
-```
-
-或者使用服务器的实际IP地址或域名：
-
-```http
-GET http://your-server-ip:3000/http://nginx.org/download/nginx-1.20.2.tar.gz
-```
-
-### 实际场景
-
-1. 部署服务器到国内服务器
-2. 配置代理（如使用 `HTTP_PROXY=http://127.0.0.1:7890`）
-3. 访问
-   `http://your-domain.com/http://nginx.org/download/nginx-1.20.2.tar.gz`
-   下载文件
-
-## 生产环境部署（Linux）
-
-### 1. 创建系统服务
-
-```bash
-# 创建服务文件
 sudo cat > /etc/systemd/system/cors.service <<EOF
 [Unit]
 Description=HTTP Proxy Server
@@ -165,6 +94,7 @@ Type=simple
 User=nobody
 Environment="HTTP_PROXY=http://127.0.0.1:7890"
 Environment="PORT=3000"
+Environment="PARALLEL_CONNS=8"
 ExecStart=/usr/local/bin/cors
 Restart=always
 RestartSec=10
@@ -173,60 +103,30 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
-# 移动二进制文件到系统目录
 sudo mv cors /usr/local/bin/
 sudo chmod +x /usr/local/bin/cors
-
-# 启动服务
 sudo systemctl daemon-reload
 sudo systemctl start cors
 sudo systemctl enable cors
-
-# 检查服务状态
-sudo systemctl status cors
 ```
 
-### 2. 配置防火墙
+### Docker Compose
 
-```bash
-# 允许 3000 端口
-sudo ufw allow 3000/tcp
+```yaml
+version: '3.8'
+services:
+  cors:
+    container_name: cors
+    image: ghcr.io/zydou/cors:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - HTTP_PROXY=http://127.0.0.1:7890
+      - PARALLEL_CONNS=8
+    restart: unless-stopped
 ```
 
-## 安全注意事项
+## License
 
-1. **限制访问**：只允许信任的客户端访问
-2. **加密传输**：使用 HTTPS（推荐使用 Nginx 反向代理）
-3. **请求验证**：添加请求频率限制
-4. **日志记录**：记录访问日志以便分析
-
-## 性能优化建议
-
-1. **增大超时时间**：适用于大文件下载
-2. **启用 Gzip 压缩**：减少传输数据量（如果服务支持）
-3. **添加访问限制**：防止滥用
-4. **监控和日志**：定期检查运行状态
-
-## 故障排除
-
-### 常见问题
-
-1. **无法访问代理服务器**：
-   - 检查防火墙设置
-   - 确认服务器正在运行
-   - 检查端口是否被占用
-
-2. **代理请求失败**：
-   - 检查目标 URL 是否正确
-   - 确认网络连接
-   - 查看服务器日志
-   - 检查代理配置是否正确
-
-3. **下载速度慢**：
-   - 检查网络连接
-   - 确认代理服务器速度
-   - 尝试其他代理地址
-
-## 许可证
-
-MIT License
+[MIT](LICENSE)
