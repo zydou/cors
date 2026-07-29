@@ -78,6 +78,19 @@ func validateTargetURL(rawURL string) error {
 	return nil
 }
 
+// githubToken 服务端统一配置的 GitHub Token，用于提高 GitHub 资源下载的限流额度
+// 客户端未提供 Authorization 时自动注入
+var githubToken = os.Getenv("GITHUB_TOKEN")
+
+// isGitHubURL 判断目标 URL 是否为 GitHub 相关域名（github.com / *.github.com / *.githubusercontent.com）
+func isGitHubURL(u *url.URL) bool {
+	host := strings.ToLower(u.Hostname())
+	if host == "github.com" || strings.HasSuffix(host, ".github.com") || strings.HasSuffix(host, ".githubusercontent.com") {
+		return true
+	}
+	return false
+}
+
 // parallelConns 并行下载的连接数（可通过 PARALLEL_CONNS 环境变量覆盖）
 // 范围：1（禁用并行）~ 16（上限，超过无益且可能被上游限速）
 const maxParallelConns = 16
@@ -186,7 +199,7 @@ func probeRangeSupport(ctx context.Context, targetUrl string, clientHeaders http
 	}
 	// 转发客户端头（如 Accept、User-Agent），使探测结果更准确
 	if clientHeaders != nil {
-		forwardHeaders(req.Header, clientHeaders)
+		forwardHeaders(req.Header, clientHeaders, targetUrl)
 	}
 
 	resp, err := client.Do(req)
@@ -294,7 +307,9 @@ func parallelDownload(ctx context.Context, targetUrl string, totalSize int64, nu
 
 // forwardHeaders 将客户端请求头转发给上游，删除不应传递的头
 // 删除 Referer（绕过防盗链）、Host（Go 自动设置为目标地址）、Range（分块请求自行设置）
-func forwardHeaders(dst, src http.Header) {
+// 对 GitHub 目标，若客户端未提供 Authorization，自动注入服务端 GITHUB_TOKEN
+func forwardHeaders(dst, src http.Header, targetURL string) {
+	clientHasAuth := false
 	for key, values := range src {
 		// 跳过代理自身需要设置的头和可能引发问题的头
 		switch strings.ToLower(key) {
@@ -303,8 +318,18 @@ func forwardHeaders(dst, src http.Header) {
 			"proxy-authorization", "proxy-connection":
 			continue
 		}
+		if strings.EqualFold(key, "Authorization") {
+			clientHasAuth = true
+		}
 		for _, v := range values {
 			dst.Add(key, v)
+		}
+	}
+
+	// 服务端统一 Token 注入：GitHub 目标 + 客户端未自带认证 + 服务端配了 Token
+	if !clientHasAuth && githubToken != "" {
+		if u, err := url.Parse(targetURL); err == nil && isGitHubURL(u) {
+			dst.Set("Authorization", "Bearer "+githubToken)
 		}
 	}
 }
@@ -316,7 +341,7 @@ func downloadChunk(ctx context.Context, targetUrl string, start, end int64, clie
 		return nil, fmt.Errorf("create request failed: %w", err)
 	}
 	// 转发客户端头（Referer 等已过滤）
-	forwardHeaders(req.Header, clientHeaders)
+	forwardHeaders(req.Header, clientHeaders, targetUrl)
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 
 	resp, err := client.Do(req)
@@ -576,7 +601,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 转发客户端头（Referer 等已过滤）
-	forwardHeaders(singleReq.Header, r.Header)
+	forwardHeaders(singleReq.Header, r.Header, targetUrl)
 
 	proxyResp, err := client.Do(singleReq)
 	if err != nil {
@@ -631,6 +656,13 @@ func main() {
 		log.Printf("HTTP_PROXY configured: %s", httpProxy)
 	} else {
 		log.Println("HTTP_PROXY not configured, using direct connection")
+	}
+
+	// 检查 GitHub Token 配置
+	if githubToken != "" {
+		log.Println("GITHUB_TOKEN configured: GitHub downloads will use server token for higher rate limits")
+	} else {
+		log.Println("GITHUB_TOKEN not configured: GitHub downloads will be unauthenticated (60 req/h limit)")
 	}
 
 	// 设置路由

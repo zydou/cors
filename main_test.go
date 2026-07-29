@@ -87,7 +87,7 @@ func TestForwardHeaders(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dst := make(http.Header)
-			forwardHeaders(dst, tt.input)
+			forwardHeaders(dst, tt.input, "https://example.com/test")
 
 			for _, key := range tt.wantKeys {
 				if dst.Get(key) == "" {
