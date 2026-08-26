@@ -57,7 +57,10 @@ The entire application lives in `main.go`:
 
 ```
 GET /{target-url}
-  → strip `/` prefix → URL-decode → validate → fix protocol
+  → strip `/` prefix (r.URL.Path is already percent-decoded by net/http — do NOT
+    run url.QueryUnescape on it: it would turn `+` into a space and corrupt
+    filenames like cpython-3.11.16+20260825)
+  → validate → fix protocol
   → probeRangeSupport (HEAD, 10s timeout)
       ├── Supports Range + ≥ 2MB → parallelDownload
       │     → split into 2MB chunks

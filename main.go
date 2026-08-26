@@ -476,27 +476,16 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 从 URL 中提取代理目标地址
-	path := strings.TrimPrefix(r.URL.Path, "/")
-	if len(path) == 0 {
+	// 注意：r.URL.Path 已由 net/http 完成百分号解码，无需再手动 unescape。
+	// 不能用 url.QueryUnescape——它按查询串规则把 + 解成空格，
+	// 会破坏含 + 的文件名（如 cpython-3.11.16+20260825）
+	targetUrl := strings.TrimPrefix(r.URL.Path, "/")
+	if len(targetUrl) == 0 {
 		w.WriteHeader(http.StatusOK)
 		res := Response{
 			Code:  0,
 			Usage: "GET Host/{URL}",
 			Note:  "Proxy server for downloading files from external resources",
-		}
-		json.NewEncoder(w).Encode(res)
-		return
-	}
-
-	// 解码 URL
-	targetUrl, err := url.QueryUnescape(path)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		res := Response{
-			Code:  400,
-			Usage: "GET Host/{URL}",
-			Note:  "Proxy server for downloading files from external resources",
-			Msg:   "URL decoding failed",
 		}
 		json.NewEncoder(w).Encode(res)
 		return
@@ -635,15 +624,16 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	fw := newFlushWriter(w, flusher, 100*time.Millisecond)
 	defer fw.stop()
 
-	_, err = io.CopyBuffer(fw, proxyResp.Body, buf)
+	n, err := io.CopyBuffer(fw, proxyResp.Body, buf)
 	if err != nil {
 		// 此时 header 和 body 已部分写入，无法再返回 JSON 错误响应
 		// 只能记录日志，客户端会收到截断的响应
-		log.Printf("Error copying response body to client: %v (target: %s)", err, targetUrl)
+		log.Printf("Error copying response body to client after %d bytes: %v (target: %s)", n, err, targetUrl)
 		return
 	}
 
-	log.Printf("Successfully proxied %d bytes from: %s", proxyResp.ContentLength, targetUrl)
+	// 记录上游状态码：4xx/5xx 时字节数很小，仅凭字节数无法区分成功与错误页
+	log.Printf("Proxied %d bytes (upstream status %d) from: %s", n, proxyResp.StatusCode, targetUrl)
 }
 
 func main() {
