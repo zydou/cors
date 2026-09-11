@@ -115,49 +115,26 @@ type Response struct {
 	Msg   string `json:"msg,omitempty"`
 }
 
-// flushWriter 包装 io.Writer，周期性调用 Flush 确保数据及时推送
-// 用于慢源站场景：避免数据积存在 bufio 中导致客户端长时间收不到数据
+// flushWriter 包装 io.Writer，每次写入成功后立即 Flush，确保数据及时推送
+// 必须在处理请求的同一 goroutine 内 Flush：http.ResponseWriter 底层的
+// bufio.Writer 不是线程安全的，从其他 goroutine 并发 Flush 会产生数据竞争，
+// 破坏缓冲区状态导致 Write 返回 short write、响应流提前中断。
+// （此前用后台 ticker goroutine 周期性 Flush 正是该竞态的根因）
 type flushWriter struct {
-	w      io.Writer
+	w       io.Writer
 	flusher http.Flusher
-	ticker *time.Ticker
-	done   chan struct{}
-	once   sync.Once // 保证 stop 幂等，防止 double-close channel panic
 }
 
-func newFlushWriter(w io.Writer, flusher http.Flusher, interval time.Duration) *flushWriter {
-	fw := &flushWriter{
-		w:       w,
-		flusher: flusher,
-		ticker:  time.NewTicker(interval),
-		done:    make(chan struct{}),
-	}
-	go fw.loop()
-	return fw
-}
-
-func (fw *flushWriter) loop() {
-	for {
-		select {
-		case <-fw.ticker.C:
-			if fw.flusher != nil {
-				fw.flusher.Flush()
-			}
-		case <-fw.done:
-			return
-		}
-	}
+func newFlushWriter(w io.Writer, flusher http.Flusher) *flushWriter {
+	return &flushWriter{w: w, flusher: flusher}
 }
 
 func (fw *flushWriter) Write(p []byte) (n int, err error) {
-	return fw.w.Write(p)
-}
-
-func (fw *flushWriter) stop() {
-	fw.once.Do(func() {
-		fw.ticker.Stop()
-		close(fw.done)
-	})
+	n, err = fw.w.Write(p)
+	if err == nil && fw.flusher != nil {
+		fw.flusher.Flush()
+	}
+	return n, err
 }
 
 // copyHeaders 复制响应头，过滤掉代理自己设置的头（避免冲突）
@@ -566,9 +543,8 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 
-		// 包装 writer，周期性 flush
-		fw := newFlushWriter(w, flusher, 100*time.Millisecond)
-		defer fw.stop()
+		// 包装 writer，每次写入后立即 flush
+		fw := newFlushWriter(w, flusher)
 
 		// 使用 r.Context() 传播取消信号：客户端断开时所有下载 goroutine 自动取消
 		if err := parallelDownload(r.Context(), targetUrl, fileSize, parallelConns, chunkSize, fw, flusher, r.Header); err != nil {
@@ -620,9 +596,8 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	buf := bufPool.Get().([]byte)
 	defer bufPool.Put(buf)
 
-	// 包装 writer，每 100ms 周期性 flush，确保慢源站场景下数据及时推送
-	fw := newFlushWriter(w, flusher, 100*time.Millisecond)
-	defer fw.stop()
+	// 包装 writer，每次写入后立即 flush，确保慢源站场景下数据及时推送
+	fw := newFlushWriter(w, flusher)
 
 	n, err := io.CopyBuffer(fw, proxyResp.Body, buf)
 	if err != nil {

@@ -48,7 +48,7 @@ The entire application lives in `main.go`:
 - **`parallelDownload`** — splits file into 2MB chunks, downloads in parallel using semaphore-goroutine pipeline, writes chunks in order to client.
 - **`downloadChunk`** — downloads a single byte range and validates returned size matches request.
 - **`forwardHeaders`** — forwards client headers to upstream, removing `Referer` (bypass hotlink protection), `Host`, `Range`, and hop-by-hop headers.
-- **`flushWriter`** — wraps `io.Writer` with periodic flushing (100ms) to reduce client-perceived latency.
+- **`flushWriter`** — wraps `io.Writer` and flushes immediately after each successful write. Flush MUST happen on the request goroutine: `http.ResponseWriter`'s underlying `bufio.Writer` is not thread-safe, and flushing from a background goroutine races with `Write` (causes `io.ErrShortWrite` and truncated responses).
 - **`setCORSHeaders`** — sets `Access-Control-Allow-Origin: *` and related headers for browser-based clients.
 - **`fixUrl`** — normalizes URLs missing a protocol prefix.
 - **`copyHeaders`** — copies response headers, filtering `Content-Length` and `Accept-Ranges` to avoid conflicts.
@@ -96,7 +96,7 @@ Fallback to single-connection when:
 - **Global client singleton** — connection pooling requires reusing one `http.Client`; creating one per request would defeat the pool.
 - **512KB copy buffer** — used in `io.CopyBuffer` for efficient streaming, pooled via `sync.Pool`. Aligns with `ReadBufferSize`/`WriteBufferSize` to minimize syscalls.
 - **2MB kernel socket buffer** — set via `net.Dialer.Control` (`setsockopt(SO_RCVBUF/SO_SNDBUF)`), separate from Go's user-sized `ReadBufferSize`/`WriteBufferSize` which only affects `bufio`. Essential for high-BDP cross-border links.
-- **Periodic flush** — `flushWriter` ticks every 100ms to push data to clients, preventing buffering delays on slow upstream connections.
+- **Inline flush** — `flushWriter` flushes after every write, so data read from the (possibly slow) upstream is pushed to the client immediately instead of sitting in the server's bufio buffers.
 - **Semaphore-goroutine pipeline** — fixed 2MB chunkSize with lazy goroutine spawning: only `parallelConns` goroutines exist at any time, memory bounded to `parallelConns × chunkSize`.
 - **zero `go.mod`** — the project uses only the standard library, so no module file is needed.
 

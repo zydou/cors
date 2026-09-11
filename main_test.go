@@ -3,13 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -223,32 +223,38 @@ func TestValidateTargetURL(t *testing.T) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// flushWriter — 幂等 stop 测试（防 double-close panic）
+// flushWriter — 每次写入成功后立即 Flush
 // ═══════════════════════════════════════════════════════════════
 
-func TestFlushWriter_IdempotentStop(t *testing.T) {
-	flusher := &fakeFlusher{}
-	fw := newFlushWriter(io.Discard, flusher, 1000)
-
-	var wg sync.WaitGroup
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					t.Errorf("stop() panicked on double call: %v", r)
-				}
-			}()
-			fw.stop()
-		}()
+func TestFlushWriter_FlushAfterWrite(t *testing.T) {
+	flusher := &countingFlusher{}
+	fw := newFlushWriter(io.Discard, flusher)
+	if n, err := fw.Write([]byte("hello")); n != 5 || err != nil {
+		t.Fatalf("Write = (%d, %v), want (5, nil)", n, err)
 	}
-	wg.Wait()
+	if flusher.count != 1 {
+		t.Errorf("Flush called %d times after 1 write, want 1", flusher.count)
+	}
+
+	// 出错 writer 上不应 Flush
+	fwErr := newFlushWriter(errWriter{}, flusher)
+
+	// 写入出错时不应 Flush
+	if n, err := fwErr.Write([]byte("x")); err == nil {
+		t.Fatalf("Write on failing writer should error, got (%d, %v)", n, err)
+	}
+	if flusher.count != 1 {
+		t.Errorf("Flush called %d times after failed write, want still 1", flusher.count)
+	}
 }
 
-type fakeFlusher struct{}
+type countingFlusher struct{ count int }
 
-func (f *fakeFlusher) Flush() {}
+func (f *countingFlusher) Flush() { f.count++ }
+
+type errWriter struct{}
+
+func (errWriter) Write(p []byte) (int, error) { return 0, errors.New("write failed") }
 
 // ═══════════════════════════════════════════════════════════════
 // parallelDownload — ctx 取消后 goroutine 不泄漏
