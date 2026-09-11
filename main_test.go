@@ -1,17 +1,13 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"testing"
-	"time"
 )
 
 // ═══════════════════════════════════════════════════════════════
@@ -61,7 +57,7 @@ func TestForwardHeaders(t *testing.T) {
 			wantKeys: []string{"User-Agent", "Accept", "Accept-Language"},
 		},
 		{
-			name: "protected headers dropped",
+			name: "protected headers dropped, Range forwarded",
 			input: http.Header{
 				"Referer":           {"http://secret.com"},
 				"Host":              {"evil.com"},
@@ -70,8 +66,8 @@ func TestForwardHeaders(t *testing.T) {
 				"Transfer-Encoding": {"chunked"},
 				"User-Agent":        {"good-agent"},
 			},
-			wantKeys: []string{"User-Agent"},
-			dropKeys: []string{"Referer", "Host", "Range", "Connection", "Transfer-Encoding"},
+			wantKeys: []string{"User-Agent", "Range"},
+			dropKeys: []string{"Referer", "Host", "Connection", "Transfer-Encoding"},
 		},
 		{
 			name: "case-insensitive matching",
@@ -104,7 +100,7 @@ func TestForwardHeaders(t *testing.T) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// copyHeaders — 响应头复制并过滤
+// copyHeaders — 响应头原样透传（含 Content-Length / Accept-Ranges）
 // ═══════════════════════════════════════════════════════════════
 
 func TestCopyHeaders(t *testing.T) {
@@ -113,23 +109,23 @@ func TestCopyHeaders(t *testing.T) {
 			"Content-Type":   {"application/octet-stream"},
 			"Content-Length": {"12345"},
 			"Accept-Ranges":  {"bytes"},
+			"Content-Range":  {"bytes 0-99/12345"},
 			"X-Custom":       {"custom-value"},
 		},
 	}
 	w := httptest.NewRecorder()
 	copyHeaders(w, resp)
 
-	if got := w.Header().Get("Content-Type"); got != "application/octet-stream" {
-		t.Errorf("Content-Type = %q, want application/octet-stream", got)
-	}
-	if got := w.Header().Get("X-Custom"); got != "custom-value" {
-		t.Errorf("X-Custom = %q, want custom-value", got)
-	}
-	if got := w.Header().Get("Content-Length"); got != "" {
-		t.Errorf("Content-Length should be filtered, got %q", got)
-	}
-	if got := w.Header().Get("Accept-Ranges"); got != "" {
-		t.Errorf("Accept-Ranges should be filtered, got %q", got)
+	for key, want := range map[string]string{
+		"Content-Type":   "application/octet-stream",
+		"Content-Length": "12345",
+		"Accept-Ranges":  "bytes",
+		"Content-Range":  "bytes 0-99/12345",
+		"X-Custom":       "custom-value",
+	} {
+		if got := w.Header().Get(key); got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
+		}
 	}
 }
 
@@ -255,91 +251,6 @@ func (f *countingFlusher) Flush() { f.count++ }
 type errWriter struct{}
 
 func (errWriter) Write(p []byte) (int, error) { return 0, errors.New("write failed") }
-
-// ═══════════════════════════════════════════════════════════════
-// parallelDownload — ctx 取消后 goroutine 不泄漏
-// 先做一轮 Range 探测（HEAD），再并行下载，再 cancel 提前退出。
-// ═══════════════════════════════════════════════════════════════
-
-func TestParallelDownload_Success(t *testing.T) {
-	content := make([]byte, 200)
-	for i := range content {
-		content[i] = byte(i)
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Accept-Ranges", "bytes")
-		if r.Method == "HEAD" {
-			w.Header().Set("Content-Length", "200")
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		// 解析 Range: bytes=start-end
-		rangeHdr := r.Header.Get("Range")
-		start, end := parseRange(rangeHdr, len(content)-1)
-		w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
-		w.WriteHeader(http.StatusPartialContent)
-		w.Write(content[start : end+1])
-	}))
-	defer server.Close()
-
-	var buf bytes.Buffer
-	err := parallelDownload(context.Background(), server.URL, 200, 4, 50, &buf, nil, nil)
-	if err != nil {
-		t.Fatalf("parallelDownload error: %v", err)
-	}
-	if !bytes.Equal(buf.Bytes(), content) {
-		t.Errorf("got %d bytes, want %d bytes matching content", buf.Len(), len(content))
-	}
-}
-
-func TestParallelDownload_CancelNoLeak(t *testing.T) {
-	content := make([]byte, 500)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Accept-Ranges", "bytes")
-		if r.Method == "HEAD" {
-			w.Header().Set("Content-Length", "500")
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		rangeHdr := r.Header.Get("Range")
-		start, end := parseRange(rangeHdr, len(content)-1)
-		w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
-		w.WriteHeader(http.StatusPartialContent)
-		w.Write(content[start : end+1])
-	}))
-	defer server.Close()
-
-	// 立刻取消
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	var buf bytes.Buffer
-	err := parallelDownload(ctx, server.URL, 500, 4, 50, &buf, nil, nil)
-	if err == nil {
-		t.Error("expected error from cancelled context, got nil")
-	}
-
-	// 给 goroutine 退出的时间，若泄漏则此步后 goroutine 数异常升高（CI 下可用 go test -race 辅助检测）
-	time.Sleep(200 * time.Millisecond)
-}
-
-// parseRange 解析 "bytes=start-end" 头中的起止位置
-func parseRange(hdr string, defaultEnd int) (int, int) {
-	if !strings.HasPrefix(hdr, "bytes=") {
-		return 0, defaultEnd
-	}
-	spec := strings.TrimPrefix(hdr, "bytes=")
-	parts := strings.Split(spec, "-")
-	if len(parts) != 2 {
-		return 0, defaultEnd
-	}
-	start, err1 := strconv.Atoi(parts[0])
-	end, err2 := strconv.Atoi(parts[1])
-	if err1 != nil || err2 != nil || start > end || end > defaultEnd {
-		return 0, defaultEnd
-	}
-	return start, end
-}
 
 // ═══════════════════════════════════════════════════════════════
 // proxyHandler 集成测试

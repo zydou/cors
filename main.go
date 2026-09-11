@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -91,22 +90,6 @@ func isGitHubURL(u *url.URL) bool {
 	return false
 }
 
-// parallelConns 并行下载的连接数（可通过 PARALLEL_CONNS 环境变量覆盖）
-// 范围：1（禁用并行）~ 16（上限，超过无益且可能被上游限速）
-const maxParallelConns = 16
-
-var parallelConns = func() int {
-	if v := os.Getenv("PARALLEL_CONNS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			if n > maxParallelConns {
-				return maxParallelConns
-			}
-			return n
-		}
-	}
-	return 8
-}()
-
 // Response 标准响应格式
 type Response struct {
 	Code  int    `json:"code"`
@@ -137,12 +120,11 @@ func (fw *flushWriter) Write(p []byte) (n int, err error) {
 	return n, err
 }
 
-// copyHeaders 复制响应头，过滤掉代理自己设置的头（避免冲突）
+// copyHeaders 复制上游响应头到客户端（原样透传，含 Content-Length /
+// Content-Range / Accept-Ranges，保证客户端可见文件大小并可断点续传；
+// hop-by-hop 头已由 net/http 剥离）
 func copyHeaders(w http.ResponseWriter, resp *http.Response) {
 	for name, values := range resp.Header {
-		if strings.EqualFold(name, "Content-Length") || strings.EqualFold(name, "Accept-Ranges") {
-			continue
-		}
 		for _, value := range values {
 			w.Header().Add(name, value)
 		}
@@ -160,137 +142,15 @@ func fixUrl(u string) string {
 	}
 }
 
-// chunkResult 存储单个分块的下载结果
-type chunkResult struct {
-	index int
-	data  []byte
-	err   error
-}
-
-// probeRangeSupport 探测目标服务器是否支持 HTTP Range 请求
-// 返回 (是否支持, 文件大小)
-func probeRangeSupport(ctx context.Context, targetUrl string, clientHeaders http.Header) (bool, int64) {
-	req, err := http.NewRequestWithContext(ctx, "HEAD", targetUrl, nil)
-	if err != nil {
-		return false, 0
-	}
-	// 转发客户端头（如 Accept、User-Agent），使探测结果更准确
-	if clientHeaders != nil {
-		forwardHeaders(req.Header, clientHeaders, targetUrl)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return false, 0
-	}
-	defer resp.Body.Close()
-
-	// 检查服务器是否声明支持 Range
-	if resp.Header.Get("Accept-Ranges") != "bytes" {
-		return false, 0
-	}
-
-	// 检查是否有 Content-Length（Chunked 编码无法分块）
-	if resp.ContentLength <= 0 {
-		return false, 0
-	}
-
-	// 如果响应是压缩的（gzip/br等），Range 分块后拼接会得到损坏数据
-	// 因为每个分块独立解压，无法无缝拼接。回退到单连接。
-	if ce := resp.Header.Get("Content-Encoding"); ce != "" && ce != "identity" {
-		return false, 0
-	}
-
-	return true, resp.ContentLength
-}
-
-// parallelDownload 多连接并行 Range 下载
-// ctx: 用于取消下载（客户端断开时）
-// numConnections: 最大并行连接数（semaphore 控制）
-// chunkSize: 每个分块大小（字节）
-// clientHeaders: 客户端请求头（会被转发给上游，Referer 已过滤）
-func parallelDownload(ctx context.Context, targetUrl string, totalSize int64, numConnections int, chunkSize int64, w io.Writer, flusher http.Flusher, clientHeaders http.Header) error {
-	// 计算分块数量
-	totalChunks := int((totalSize + chunkSize - 1) / chunkSize)
-
-	// 每个 chunk 一个 channel，用于有序传递结果
-	channels := make([]chan chunkResult, totalChunks)
-	for i := range channels {
-		channels[i] = make(chan chunkResult, 1)
-	}
-
-	// semaphore 限制同时运行的下载 goroutine 数量
-	// 采用"按需启动"策略：只有获取到信号量时才 spawn goroutine
-	sem := make(chan struct{}, numConnections)
-	var wg sync.WaitGroup
-
-	startedChunks := 0
-	for i := 0; i < totalChunks; i++ {
-		// 获取信号量（如果没有空闲连接，阻塞等待）
-		select {
-		case sem <- struct{}{}:
-		case <-ctx.Done():
-			// ctx 取消：给未启动的 chunk 发送错误结果，让 wg 能归零
-			for j := startedChunks; j < totalChunks; j++ {
-				channels[j] <- chunkResult{index: j, err: ctx.Err()}
-			}
-			return ctx.Err()
-		}
-
-		startedChunks++
-		wg.Add(1)
-		go func(chunkIndex int) {
-			defer wg.Done()
-			defer func() { <-sem }() // 释放信号量，让下一个 chunk 启动
-
-			start := int64(chunkIndex) * chunkSize
-			end := start + chunkSize - 1
-			if end >= totalSize {
-				end = totalSize - 1
-			}
-
-			data, err := downloadChunk(ctx, targetUrl, start, end, clientHeaders)
-			channels[chunkIndex] <- chunkResult{index: chunkIndex, data: data, err: err}
-		}(i)
-	}
-
-	// 等待所有 goroutine 完成后关闭所有 channel
-	go func() {
-		wg.Wait()
-		for _, ch := range channels {
-			close(ch)
-		}
-	}()
-
-	// 按顺序从各 channel 接收并写入客户端
-	for i := 0; i < totalChunks; i++ {
-		result, ok := <-channels[i]
-		if !ok {
-			return fmt.Errorf("chunk %d: channel closed unexpectedly", i)
-		}
-		if result.err != nil {
-			return result.err
-		}
-		if _, err := w.Write(result.data); err != nil {
-			return fmt.Errorf("chunk %d: write to client failed: %w", i, err)
-		}
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
-
-	return nil
-}
-
 // forwardHeaders 将客户端请求头转发给上游，删除不应传递的头
-// 删除 Referer（绕过防盗链）、Host（Go 自动设置为目标地址）、Range（分块请求自行设置）
+// 删除 Referer（绕过防盗链）、Host（Go 自动设置为目标地址）
 // 对 GitHub 目标，若客户端未提供 Authorization，自动注入服务端 GITHUB_TOKEN
 func forwardHeaders(dst, src http.Header, targetURL string) {
 	clientHasAuth := false
 	for key, values := range src {
 		// 跳过代理自身需要设置的头和可能引发问题的头
 		switch strings.ToLower(key) {
-		case "referer", "host", "range", "if-none-match", "if-modified-since",
+		case "referer", "host",
 			"connection", "transfer-encoding", "te", "trailer", "upgrade",
 			"proxy-authorization", "proxy-connection":
 			continue
@@ -309,43 +169,6 @@ func forwardHeaders(dst, src http.Header, targetURL string) {
 			dst.Set("Authorization", "Bearer "+githubToken)
 		}
 	}
-}
-
-// downloadChunk 下载单个分块，并验证返回大小与请求范围一致
-func downloadChunk(ctx context.Context, targetUrl string, start, end int64, clientHeaders http.Header) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", targetUrl, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request failed: %w", err)
-	}
-	// 转发客户端头（Referer 等已过滤）
-	forwardHeaders(req.Header, clientHeaders, targetUrl)
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// 接受 206（正常 Range 响应）或 200（服务器忽略 Range 返回完整文件）
-	// 但 200 时 chunk 大小验证会捕获异常
-	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read body failed: %w", err)
-	}
-
-	// 关键安全验证：确保返回大小与请求范围一致
-	// 如果服务器忽略 Range 返回完整文件，这里会检测到并返回错误
-	expectedLen := end - start + 1
-	if int64(len(data)) != expectedLen {
-		return nil, fmt.Errorf("size mismatch: got %d bytes, expected %d (status %d)", len(data), expectedLen, resp.StatusCode)
-	}
-
-	return data, nil
 }
 
 // 全局复用 HTTP 客户端 —— 连接池真正生效
@@ -514,50 +337,9 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Proxying GET request to: %s", targetUrl)
 
-	// 获取 flusher（并行下载和单连接下载都需要）
-	flusher, canFlush := w.(http.Flusher)
-	if !canFlush {
-		log.Println("Warning: ResponseWriter does not support Flushing")
-	}
-
-	// 尝试多连接并行 Range 下载（大文件跨境场景最优）
-	const (
-		minParallelSize = 2 * 1024 * 1024 // 2MB 以下不并行
-		chunkSize       = 2 * 1024 * 1024 // 每个分块 2MB
-	)
-
-	// 使用带超时的 context 探测（10s），避免 HEAD 挂起阻塞请求
-	probeCtx, probeCancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer probeCancel()
-
-	if supportsRange, fileSize := probeRangeSupport(probeCtx, targetUrl, r.Header); supportsRange && fileSize >= minParallelSize && parallelConns > 1 {
-		log.Printf("Parallel download: %d connections, %d bytes, chunk %dKB",
-			parallelConns, fileSize, chunkSize/1024)
-
-		// 设置响应头（代理重组完整文件，返回 200）
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", fileSize))
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Accept-Ranges", "bytes")
-		w.WriteHeader(http.StatusOK)
-		if canFlush {
-			flusher.Flush()
-		}
-
-		// 包装 writer，每次写入后立即 flush
-		fw := newFlushWriter(w, flusher)
-
-		// 使用 r.Context() 传播取消信号：客户端断开时所有下载 goroutine 自动取消
-		if err := parallelDownload(r.Context(), targetUrl, fileSize, parallelConns, chunkSize, fw, flusher, r.Header); err != nil {
-			log.Printf("Parallel download failed: %v (target: %s)", err, targetUrl)
-			return
-		}
-
-		log.Printf("Successfully parallel-proxied %d bytes from: %s", fileSize, targetUrl)
-		return
-	}
-
-	// 回退：单连接流式下载（小文件 / 不支持 Range 的源站）
-	singleReq, err := http.NewRequestWithContext(r.Context(), "GET", targetUrl, nil)
+	// 单连接流式转发：客户端头原样透传（含 Range，支持断点续传），
+	// 上游响应头原样透传（含 Content-Length / Accept-Ranges），状态码一致
+	proxyReq, err := http.NewRequestWithContext(r.Context(), "GET", targetUrl, nil)
 	if err != nil {
 		log.Printf("Error creating request: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -565,10 +347,9 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(res)
 		return
 	}
-	// 转发客户端头（Referer 等已过滤）
-	forwardHeaders(singleReq.Header, r.Header, targetUrl)
+	forwardHeaders(proxyReq.Header, r.Header, targetUrl)
 
-	proxyResp, err := client.Do(singleReq)
+	proxyResp, err := client.Do(proxyReq)
 	if err != nil {
 		log.Printf("Error proxying request: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -583,20 +364,18 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer proxyResp.Body.Close()
 
-	// 复制响应头（过滤掉代理自己要设置的头，避免冲突）
+	// 复制上游响应头（hop-by-hop 头已由 net/http 剥离）
 	copyHeaders(w, proxyResp)
 
 	// 写入响应状态和内容
 	w.WriteHeader(proxyResp.StatusCode)
-	if canFlush {
-		flusher.Flush()
-	}
 
 	// 从池中获取 buffer，减少分配
 	buf := bufPool.Get().([]byte)
 	defer bufPool.Put(buf)
 
 	// 包装 writer，每次写入后立即 flush，确保慢源站场景下数据及时推送
+	flusher, _ := w.(http.Flusher)
 	fw := newFlushWriter(w, flusher)
 
 	n, err := io.CopyBuffer(fw, proxyResp.Body, buf)
