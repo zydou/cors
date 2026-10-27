@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
+	"time"
 )
 
 // ═══════════════════════════════════════════════════════════════
@@ -39,6 +42,7 @@ func TestFixUrl(t *testing.T) {
 // ═══════════════════════════════════════════════════════════════
 
 func TestForwardHeaders(t *testing.T) {
+	target, _ := url.Parse("https://example.com/test")
 	tests := []struct {
 		name     string
 		input    http.Header
@@ -81,7 +85,7 @@ func TestForwardHeaders(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dst := make(http.Header)
-			forwardHeaders(dst, tt.input, "https://example.com/test")
+			forwardHeaders(dst, tt.input, target)
 
 			for _, key := range tt.wantKeys {
 				if dst.Get(key) == "" {
@@ -92,6 +96,33 @@ func TestForwardHeaders(t *testing.T) {
 				if dst.Get(key) != "" {
 					t.Errorf("expected header %q to be dropped, got %q", key, dst.Get(key))
 				}
+			}
+		})
+	}
+}
+
+func TestForwardHeadersGitHubToken(t *testing.T) {
+	old := githubToken
+	githubToken = "server-token"
+	t.Cleanup(func() { githubToken = old })
+
+	tests := []struct {
+		name   string
+		target string
+		input  http.Header
+		want   string
+	}{
+		{"github target gets server token", "https://api.github.com/repos", http.Header{}, "Bearer server-token"},
+		{"client auth takes precedence", "https://github.com/x", http.Header{"Authorization": {"Bearer client"}}, "Bearer client"},
+		{"non-github target untouched", "https://example.com/x", http.Header{}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			u, _ := url.Parse(tt.target)
+			dst := make(http.Header)
+			forwardHeaders(dst, tt.input, u)
+			if got := dst.Get("Authorization"); got != tt.want {
+				t.Errorf("Authorization = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -132,50 +163,35 @@ func TestCopyHeaders(t *testing.T) {
 // ═══════════════════════════════════════════════════════════════
 
 func TestFlushWriter_FlushAfterWrite(t *testing.T) {
-	flusher := &countingFlusher{}
-	fw := newFlushWriter(io.Discard, flusher)
+	rec := httptest.NewRecorder()
+	fw := flushWriter{w: rec, rc: http.NewResponseController(rec)}
 	if n, err := fw.Write([]byte("hello")); n != 5 || err != nil {
 		t.Fatalf("Write = (%d, %v), want (5, nil)", n, err)
 	}
-	if flusher.count != 1 {
-		t.Errorf("Flush called %d times after 1 write, want 1", flusher.count)
+	if !rec.Flushed {
+		t.Error("expected Flush after successful write")
 	}
-
-	// 出错 writer 上不应 Flush
-	fwErr := newFlushWriter(errWriter{}, flusher)
 
 	// 写入出错时不应 Flush
-	if n, err := fwErr.Write([]byte("x")); err == nil {
-		t.Fatalf("Write on failing writer should error, got (%d, %v)", n, err)
+	rec = httptest.NewRecorder()
+	fw = flushWriter{w: errWriter{}, rc: http.NewResponseController(rec)}
+	if _, err := fw.Write([]byte("x")); err == nil {
+		t.Fatal("Write on failing writer should error")
 	}
-	if flusher.count != 1 {
-		t.Errorf("Flush called %d times after failed write, want still 1", flusher.count)
+	if rec.Flushed {
+		t.Error("Flush must not happen after failed write")
 	}
 }
-
-type countingFlusher struct{ count int }
-
-func (f *countingFlusher) Flush() { f.count++ }
 
 type errWriter struct{}
 
 func (errWriter) Write(p []byte) (int, error) { return 0, errors.New("write failed") }
 
 // ═══════════════════════════════════════════════════════════════
-// proxyHandler 集成测试
-//
-// 思路：起一个假上游服务器（httptest.Server），再用另一个
-// httptest.Server 包装 proxyHandler，对它发请求打到上游，
-// 验证代理行为是否符合预期。
+// proxyHandler — 集成测试：起假上游，经代理访问，验证行为
 // ═══════════════════════════════════════════════════════════════
 
-// newProxyTestServer 创建一个带假上游的 proxyHandler 测试服务器
-func newProxyTestServer(upstream http.Handler) *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(proxyHandler))
-}
-
 func TestProxyHandler_IndexPage(t *testing.T) {
-	// 空路径返回使用说明（只需确认 200 + 没走网络）
 	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
 	defer proxy.Close()
 
@@ -188,21 +204,62 @@ func TestProxyHandler_IndexPage(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
 	}
-	// 不严格检查 Content-Type（关键是 handler 返回了 JSON 结构）
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
 }
 
-func TestProxyHandler_BlocksInvalidURL(t *testing.T) {
+func TestProxyHandler_InvalidURL(t *testing.T) {
 	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
 	defer proxy.Close()
 
-	// 不满足 “含 . 且长度 > 3” 的前置检查
-	resp, err := http.Get(proxy.URL + "/ab")
+	for _, path := range []string{"/ftp://example.com/file", "/http://"} {
+		resp, err := http.Get(proxy.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("path %s: status = %d, want 400", path, resp.StatusCode)
+		}
+	}
+}
+
+// TestProxyHandler_Forwarding 验证完整转发链路：状态码、body、Range、CORS，以及 Referer 被删除
+func TestProxyHandler_Forwarding(t *testing.T) {
+	content := []byte("hello world")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Referer") != "" {
+			t.Error("Referer should be stripped before reaching upstream")
+		}
+		http.ServeContent(w, r, "file.bin", time.Time{}, bytes.NewReader(content))
+	}))
+	defer upstream.Close()
+
+	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+	defer proxy.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, proxy.URL+"/"+upstream.URL+"/file.bin", nil)
+	req.Header.Set("Range", "bytes=0-4")
+	req.Header.Set("Referer", "http://secret.example")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want 400", resp.StatusCode)
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Errorf("status = %d, want 206", resp.StatusCode)
+	}
+	if string(body) != "hello" {
+		t.Errorf("body = %q, want %q", body, "hello")
+	}
+	if cr := resp.Header.Get("Content-Range"); cr != "bytes 0-4/11" {
+		t.Errorf("Content-Range = %q, want %q", cr, "bytes 0-4/11")
+	}
+	if ao := resp.Header.Get("Access-Control-Allow-Origin"); ao != "*" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want *", ao)
 	}
 }
 
@@ -237,7 +294,6 @@ func TestProxyHandler_OPTIONS(t *testing.T) {
 	if resp.StatusCode != http.StatusNoContent {
 		t.Errorf("status = %d, want 204", resp.StatusCode)
 	}
-	// CORS 头
 	if ao := resp.Header.Get("Access-Control-Allow-Origin"); ao != "*" {
 		t.Errorf("Access-Control-Allow-Origin = %q, want *", ao)
 	}
@@ -261,25 +317,5 @@ func TestSetCORSHeaders(t *testing.T) {
 		if got := w.Header().Get(k); got != v {
 			t.Errorf("%s = %q, want %q", k, got, v)
 		}
-	}
-}
-
-// ═══════════════════════════════════════════════════════════════
-// getPort — 单测
-// ═══════════════════════════════════════════════════════════════
-
-func TestGetPort(t *testing.T) {
-	// 无环境变量
-	t.Setenv("PORT", "")  // 清空
-	// 注意：Setenv 设置的 "" 仍会让 os.Getenv 返回 "", 所以 getPort 会返回 "3000"
-	// 要测环境变量生效需显式设置
-	t.Setenv("PORT", "8080")
-	if got := getPort(); got != "8080" {
-		t.Errorf("getPort with PORT=8080: got %q, want 8080", got)
-	}
-
-	t.Setenv("PORT", "")
-	if got := getPort(); got != "3000" {
-		t.Errorf("getPort without PORT: got %q, want 3000", got)
 	}
 }
