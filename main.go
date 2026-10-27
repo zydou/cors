@@ -419,27 +419,29 @@ func main() {
 		Handler: mux,
 	}
 
-	// 优雅关闭：捕获 SIGTERM/SIGINT
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-		sig := <-sigCh
-		log.Printf("Received signal %s, shutting down gracefully...", sig)
+	// 优雅关闭：捕获 SIGTERM/SIGINT。ListenAndServe 在 Shutdown 开始时就会返回，
+	// 所以必须阻塞等待 Shutdown 结束，否则 main 退出会中断进行中的下载
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
 
-		// 给正在进行的请求 30 秒完成
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			log.Printf("Graceful shutdown failed: %v", err)
+	go func() {
+		log.Printf("Proxy server is running on http://0.0.0.0:%s", getPort())
+		log.Printf("Usage: GET http://0.0.0.0:%s/{URL}", getPort())
+		log.Printf("Example: GET http://0.0.0.0:%s/http://nginx.org/download/nginx-1.20.2.tar.gz", getPort())
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Failed to start server: %v", err)
 		}
 	}()
 
-	log.Printf("Proxy server is running on http://0.0.0.0:%s", getPort())
-	log.Printf("Usage: GET http://0.0.0.0:%s/{URL}", getPort())
-	log.Printf("Example: GET http://0.0.0.0:%s/http://nginx.org/download/nginx-1.20.2.tar.gz", getPort())
+	<-ctx.Done()
+	stop()
+	log.Println("Shutting down gracefully...")
 
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("Failed to start server: %v", err)
+	// 给正在进行的请求 30 秒完成
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Graceful shutdown failed: %v", err)
 	}
 	log.Println("Server stopped.")
 }
