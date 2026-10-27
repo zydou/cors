@@ -41,7 +41,7 @@ The entire application lives in `main.go`:
 
 - **`client`** — package-level singleton `http.Client` initialized once at startup. Connection pooling only works because the same client is reused across all requests.
 - **`bufPool`** — `sync.Pool` recycling 512KB copy buffers to reduce GC pressure under high concurrency.
-- **`proxyHandler`** — single HTTP handler registered on `/`. Extracts the target URL from the request path, validates it, then streams the upstream response to the client over a single connection.
+- **`proxyHandler`** — the server's single HTTP handler (no `ServeMux`, which would rewrite `//` in the target URL with a 307). Extracts the target URL from the request path, validates it, then streams the upstream response to the client over a single connection.
 - **`createHTTPClient`** — builds the transport with proxy support, tuned connection pool, TCP buffer sizing, and kernel-level socket buffer control. Called once at package init.
 - **`forwardHeaders`** — forwards client headers to upstream, removing `Referer` (bypass hotlink protection), `Host`, and hop-by-hop headers. `Range` is forwarded so resumable downloads work end to end.
 - **`flushWriter`** — wraps `io.Writer` and flushes immediately after each successful write. Flush MUST happen on the request goroutine: `http.ResponseWriter`'s underlying `bufio.Writer` is not thread-safe, and flushing from a background goroutine races with `Write` (causes `io.ErrShortWrite` and truncated responses).
@@ -56,7 +56,7 @@ GET /{target-url}
   → strip `/` prefix (r.URL.Path is already percent-decoded by net/http — do NOT
     run url.QueryUnescape on it: it would turn `+` into a space and corrupt
     filenames like cpython-3.11.16+20260825)
-  → validate → fix protocol
+  → fix protocol → append raw query string → validate (http/https scheme and non-empty host, else 400)
   → forward client headers (Range included) → GET upstream
   → copy upstream status + headers → stream body via io.CopyBuffer + inline flush
 ```
@@ -66,8 +66,9 @@ GET /{target-url}
 - **CORS enabled** — all responses include `Access-Control-Allow-Origin: *`, allowing browser-based clients to use the proxy directly. OPTIONS preflight returns 204.
 - **Transparent streaming proxy** — upstream status, headers (including `Content-Length`/`Content-Range`/`Accept-Ranges`), and client `Range` requests pass through unchanged. Resumable downloads (`curl -C -`) work without the proxy tracking any state; a mid-transfer disconnect is the client's to retry with `Range`.
 - **Client header forwarding** — all client headers (User-Agent, Accept, Accept-Language, Cookie, etc.) are forwarded to upstream. `Referer` is stripped to bypass hotlink protection; `Host` and hop-by-hop headers are managed by the proxy.
+- **Trusted users, isolated container** — the proxy is meant for trusted users and runs in an isolated distroless container, so there is no SSRF protection: any host, including loopback and private addresses, can be reached by design. Do not re-add IP filtering.
 - **GET only** — explicitly rejects other methods with a 405 JSON response.
-- **No overall timeout** — `Timeout: 0` on the HTTP client to support very large file downloads. Only `TLSHandshakeTimeout` (10s) and `ExpectContinueTimeout` (1s) are set.
+- **No overall timeout** — the `http.Client` sets no `Timeout`, so very large file downloads are not cut off. Only `TLSHandshakeTimeout` (10s) is set on the transport.
 - **Global client singleton** — connection pooling requires reusing one `http.Client`; creating one per request would defeat the pool.
 - **512KB copy buffer** — used in `io.CopyBuffer` for efficient streaming, pooled via `sync.Pool`. Aligns with `ReadBufferSize`/`WriteBufferSize` to minimize syscalls.
 - **2MB kernel socket buffer** — set via `net.Dialer.Control` (`setsockopt(SO_RCVBUF/SO_SNDBUF)`), separate from Go's user-sized `ReadBufferSize`/`WriteBufferSize` which only affects `bufio`. Essential for high-BDP cross-border links.
