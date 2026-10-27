@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -16,66 +15,6 @@ import (
 	"syscall"
 	"time"
 )
-
-// isPrivateIP 检查 IP 是否为私有/保留/链路本地地址，用于 SSRF 防护
-func isPrivateIP(ip net.IP) bool {
-	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-		return true
-	}
-	// 覆盖所有私有 CIDR
-	privateBlocks := []string{
-		"10.0.0.0/8",     // RFC1918
-		"172.16.0.0/12",  // RFC1918
-		"192.168.0.0/16", // RFC1918
-		"127.0.0.0/8",    // Loopback
-		"169.254.0.0/16", // Link-local / 云元数据
-		"100.64.0.0/10",  // CGNAT (RFC6598)
-		"::1/128",        // IPv6 loopback
-		"fc00::/7",       // IPv6 unique local
-		"fe80::/10",      // IPv6 link-local
-	}
-	for _, cidr := range privateBlocks {
-		_, block, err := net.ParseCIDR(cidr)
-		if err == nil && block.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
-// validateTargetURL 验证目标 URL 是否允许访问（SSRF 防护）
-// 解析 hostname 为任一 IP 落在私有范围则拒绝
-func validateTargetURL(rawURL string) error {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return fmt.Errorf("invalid URL: %w", err)
-	}
-	host := u.Hostname()
-	if host == "" {
-		return fmt.Errorf("URL has no host")
-	}
-
-	// 先检查 host 本身是不是字面 IP（避免 DNS 重绑定：解析后再查一次）
-	if ip := net.ParseIP(host); ip != nil {
-		if isPrivateIP(ip) {
-			return fmt.Errorf("access to private/internal IP %s is forbidden (SSRF protection)", host)
-		}
-		return nil
-	}
-
-	// 域名：解析后检查所有 A/AAAA 记录
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		// 无法解析的域名直接拒绝，不继续请求（安全侧）
-		return fmt.Errorf("cannot resolve host %s: %w", host, err)
-	}
-	for _, ip := range ips {
-		if isPrivateIP(ip) {
-			return fmt.Errorf("host %s resolves to private/internal IP %s (SSRF protection)", host, ip)
-		}
-	}
-	return nil
-}
 
 // githubToken 服务端统一配置的 GitHub Token，用于提高 GitHub 资源下载的限流额度
 // 客户端未提供 Authorization 时自动注入
@@ -316,20 +255,6 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 			Usage: "GET Host/{URL}",
 			Note:  "Proxy server for downloading files from external resources",
 			Msg:   "Invalid URL: only http and https schemes are allowed",
-		}
-		json.NewEncoder(w).Encode(res)
-		return
-	}
-
-	// SSRF 防护：检查解析后的 IP 是否落在私有/保留地址段
-	if err := validateTargetURL(targetUrl); err != nil {
-		log.Printf("Blocked private/internal request to %s from %s: %v", targetUrl, r.RemoteAddr, err)
-		w.WriteHeader(http.StatusForbidden)
-		res := Response{
-			Code:  403,
-			Usage: "GET Host/{URL}",
-			Note:  "Proxy server for downloading files from external resources",
-			Msg:   err.Error(),
 		}
 		json.NewEncoder(w).Encode(res)
 		return

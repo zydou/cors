@@ -3,10 +3,8 @@ package main
 import (
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 )
 
@@ -130,95 +128,6 @@ func TestCopyHeaders(t *testing.T) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// isPrivateIP — SSRF 防护核心
-// ═══════════════════════════════════════════════════════════════
-
-func TestIsPrivateIP(t *testing.T) {
-	tests := []struct {
-		name     string
-		ip       string
-		expected bool
-	}{
-		// — 必须拦截 —
-		{"loopback 127.0.0.1", "127.0.0.1", true},
-		{"loopback 127.0.0.53", "127.0.0.53", true},
-		{"private 10.0.0.1", "10.0.0.1", true},
-		{"private 10.255.255.255", "10.255.255.255", true},
-		{"private 192.168.1.1", "192.168.1.1", true},
-		{"private 172.16.0.1", "172.16.0.1", true},
-		{"private 172.31.255.255", "172.31.255.255", true},
-		{"cloud metadata 169.254.169.254", "169.254.169.254", true},
-		{"link-local 169.254.1.1", "169.254.1.1", true},
-		{"CGNAT 100.64.0.1", "100.64.0.1", true},
-		{"CGNAT 100.127.255.255", "100.127.255.255", true},
-		{"IPv6 loopback ::1", "::1", true},
-
-		// — 必须放行 —
-		{"public 8.8.8.8", "8.8.8.8", false},
-		{"public 1.1.1.1", "1.1.1.1", false},
-		{"public 9.9.9.9", "9.9.9.9", false},
-		{"public 203.0.113.1", "203.0.113.1", false},
-		{"boundary 172.32.0.1", "172.32.0.1", false},
-		{"boundary 100.128.0.1", "100.128.0.1", false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ip := net.ParseIP(tt.ip)
-			if ip == nil {
-				t.Fatalf("net.ParseIP(%q) returned nil", tt.ip)
-			}
-			got := isPrivateIP(ip)
-			if got != tt.expected {
-				t.Errorf("isPrivateIP(%q) = %v, want %v", tt.ip, got, tt.expected)
-			}
-		})
-	}
-}
-
-// ═══════════════════════════════════════════════════════════════
-// validateTargetURL — SSRF 防护入口（字面 IP 与无效 URL 分支）
-// ═══════════════════════════════════════════════════════════════
-
-func TestValidateTargetURL(t *testing.T) {
-	tests := []struct {
-		name    string
-		url     string
-		wantErr bool
-		errMsg  string
-	}{
-		// — 字面 IP：应拦截 —
-		{"literal loopback", "http://127.0.0.1/file", true, "forbidden"},
-		{"literal private 10.x", "http://10.0.0.1/secret", true, "forbidden"},
-		{"literal cloud metadata", "http://169.254.169.254/latest/meta-data/", true, "forbidden"},
-		{"literal 192.168.x", "http://192.168.1.1/", true, "forbidden"},
-		{"literal 172.16.x", "http://172.16.0.1/", true, "forbidden"},
-
-		// — 字面 IP：应放行（公网） —
-		{"literal public 8.8.8.8", "http://8.8.8.8/", false, ""},
-
-		// — 参数校验 —
-		{"no host", "http://", true, "no host"},
-		{"invalid URL", "://bad", true, ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := validateTargetURL(tt.url)
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("validateTargetURL(%q) expected error, got nil", tt.url)
-				} else if tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
-					t.Errorf("validateTargetURL(%q) error = %q, want substring %q", tt.url, err.Error(), tt.errMsg)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("validateTargetURL(%q) unexpected error: %v", tt.url, err)
-				}
-			}
-		})
-	}
-}
-
-// ═══════════════════════════════════════════════════════════════
 // flushWriter — 每次写入成功后立即 Flush
 // ═══════════════════════════════════════════════════════════════
 
@@ -282,39 +191,6 @@ func TestProxyHandler_IndexPage(t *testing.T) {
 	// 不严格检查 Content-Type（关键是 handler 返回了 JSON 结构）
 }
 
-func TestProxyHandler_BlocksPrivateIP(t *testing.T) {
-	// 假上游：如果代理错误地允许请求，它会连过来——但我们测的是代理没发请求
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Error("proxy should NOT have forwarded request to private IP")
-		w.WriteHeader(http.StatusTeapot) // 如果收到就是错
-	}))
-	defer upstream.Close()
-
-	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
-	defer proxy.Close()
-
-	// 用公网 IP（8.8.8.8）碰一下：应该能进 handler，但 8.8.8.8 实际上不会响应 proxy 请求（超时）。
-	// 关键断言是“handler 不返回 403”（说明过了 SSRF 检查），且“handler 尝试连接上游”
-	// 这个用例主要是为了对比。
-	// 真正测 SSRF 拦截的用例：
-	urls := []string{
-		"/http://127.0.0.1/",
-		"/http://10.0.0.1/",
-		"/http://192.168.1.1/",
-		"/http://169.254.169.254/latest/meta-data/",
-	}
-	for _, path := range urls {
-		resp, err := http.Get(proxy.URL + path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusForbidden {
-			t.Errorf("path %s: status = %d, want 403", path, resp.StatusCode)
-		}
-	}
-}
-
 func TestProxyHandler_BlocksInvalidURL(t *testing.T) {
 	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
 	defer proxy.Close()
@@ -327,28 +203,6 @@ func TestProxyHandler_BlocksInvalidURL(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", resp.StatusCode)
-	}
-}
-
-// TestProxyHandler_AllowlistInAction 通过直接调用 handler 验证：
-// 当目标主机明确不是私有 IP 时，handler 不会在验证阶段拒绝它。
-// 注意：完整的代理转发（单连接/并行下载到公网）在此不能端到端覆盖，
-// 因为请求内部网络被 SSRF 防护正确拦截；实际转发功能由
-// TestProxyHandler_HeaderForwarding 之前的 httptest 单测覆盖逻辑正确性。
-func TestProxyHandler_AllowSemantics(t *testing.T) {
-	// validateTargetURL 对公共域名不返回错误（见 TestValidateTargetURL）。
-	// 这里只测试：handler 不会把公网域名当作私有 IP 拦截。
-	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
-	defer proxy.Close()
-
-	// 公网域名不应被 SSRF 防护拦截（实际请求可能因外网不通而失败，但不是 403）
-	resp, err := http.Get(proxy.URL + "/http://example.com/")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusForbidden {
-		t.Errorf("public domain example.com should not be blocked by SSRF, got 403")
 	}
 }
 
@@ -388,11 +242,6 @@ func TestProxyHandler_OPTIONS(t *testing.T) {
 		t.Errorf("Access-Control-Allow-Origin = %q, want *", ao)
 	}
 }
-
-// TestProxyHandler_HeaderForwarding 在端到端层面测上游收到的头。
-// 由于 127.0.0.1 被 SSRF 拦截，这里改为测 forwardHeaders 单测
-// （见 TestForwardHeaders）以及对 handler 请求后的最低保证：
-// 对于公网域名，请求不会被 handler 拒绝（可能因无外网而请求失败，但不是 403）。
 
 // ═══════════════════════════════════════════════════════════════
 // setCORSHeaders — 单测
