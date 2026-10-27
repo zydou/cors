@@ -182,7 +182,13 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, fixUrl(target), nil)
+	// 查询串需一并转发（如 CDN 签名参数）。fixUrl 只处理路径部分，
+	// 避免查询串里的 "://" 被误判为目标已带协议
+	target = fixUrl(target)
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
 	if err != nil || (proxyReq.URL.Scheme != "http" && proxyReq.URL.Scheme != "https") || proxyReq.URL.Host == "" {
 		writeJSON(w, http.StatusBadRequest, http.StatusBadRequest, "Invalid URL")
 		return

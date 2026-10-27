@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -260,6 +261,35 @@ func TestProxyHandler_Forwarding(t *testing.T) {
 	}
 	if ao := resp.Header.Get("Access-Control-Allow-Origin"); ao != "*" {
 		t.Errorf("Access-Control-Allow-Origin = %q, want *", ao)
+	}
+}
+
+// TestProxyHandler_QueryString 验证查询串原样转发，且不受 "://" 与 "+" 影响
+func TestProxyHandler_QueryString(t *testing.T) {
+	gotQuery := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery <- r.URL.RawQuery
+	}))
+	defer upstream.Close()
+
+	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+	defer proxy.Close()
+
+	// 目标不带协议前缀，查询串中含 "://" 和 "+"
+	target := strings.TrimPrefix(upstream.URL, "http://") + "/file.bin?next=https://x&v=1+2"
+	resp, err := http.Get(proxy.URL + "/" + target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	select {
+	case q := <-gotQuery:
+		if q != "next=https://x&v=1+2" {
+			t.Errorf("upstream query = %q, want %q", q, "next=https://x&v=1+2")
+		}
+	default:
+		t.Fatal("request did not reach upstream")
 	}
 }
 
