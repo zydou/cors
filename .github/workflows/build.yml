@@ -5,10 +5,9 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - main.go
-      - Dockerfile
-      - main_test.go
-      - go.mod
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
       - .github/workflows/build.yml
 
 concurrency:
@@ -24,20 +23,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@main
 
-      - name: Set up Go
-        uses: actions/setup-go@main
-        with:
-          go-version: 1.26
-
-      - name: Run tests
-        run: go test -v -race -count=1 .
-
-      - name: Vet
-        run: go vet .
-
-      - name: Build smoke check
-        run: go build -o /dev/null .
-
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@master
@@ -52,16 +37,22 @@ jobs:
             type=semver,pattern=v{{major}}
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Cross compile for multiple platforms
-        env:
-          CGO_ENABLED: 0
-          GOOS: linux
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Cross
         run: |
-          GOARCH=amd64 go build -o cors-linux-amd64 main.go
-          GOARCH=arm64 go build -o cors-linux-arm64 main.go
-          GOARCH=arm go build -o cors-linux-arm main.go
-          GOARCH=ppc64le go build -o cors-linux-ppc64le main.go
-          GOARCH=s390x go build -o cors-linux-s390x main.go
+          mkdir -p "$HOME/.cargo/bin"
+          curl -sSLf https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz | tar -xzf - -C "$HOME/.cargo/bin"
+
+      - name: Cross compile for multiple platforms
+        run: |
+          "$HOME/.cargo/bin/cross" build --locked --release --target x86_64-unknown-linux-musl
+          mv target/x86_64-unknown-linux-musl/release/cors ./cors-x86_64-unknown-linux-musl
+          rm -rf target
+          "$HOME/.cargo/bin/cross" build --locked --release --target aarch64-unknown-linux-musl
+          mv target/aarch64-unknown-linux-musl/release/cors ./cors-aarch64-unknown-linux-musl
+          rm -rf target
           ls -la
 
       - name: Set up Docker Buildx
@@ -79,7 +70,7 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64,linux/arm64,linux/arm,linux/ppc64le,linux/s390x
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
